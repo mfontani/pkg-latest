@@ -43,7 +43,9 @@ RUN apt-get install -y -q \
 
 ... and `pkg-latest` will "work" on that line, changing the `=1234` version
 part to the "right" (latest) version acccording to the definition (in the above
-case, for alpine 3.13, from the main repository for the x86_64 architecture),
+case, for debian buster, from the "main" repository for the amd64
+architecture).
+
 i.e. at the time of writing:
 
 ```bash
