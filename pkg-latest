@@ -1,0 +1,326 @@
+#!/usr/bin/env perl
+use 5.020_001;
+use warnings;
+use Archive::Tar qw<>;
+use IO::Uncompress::Gunzip qw<>;
+
+=head1 LICENSE
+
+Copyright 2022 Marco Fontani <MFONTANI@cpan.org>
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice,
+   this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE
+LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
+SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
+INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
+ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+POSSIBILITY OF SUCH DAMAGE.
+
+=cut
+
+# Downloaded package lists will be saved in this directory:
+my $TMP_PACKAGE_DIR = '/tmp/pkg-latest/';
+mkdir "$TMP_PACKAGE_DIR" if !-d "$TMP_PACKAGE_DIR";
+
+=for test_cases
+
+    apache2-utils # untouched
+    apache2-utils=foo # untouched
+    # These two instead get updated with the updated versions:
+    apache2-utils=foo $(: pkg-latest alpine v3.12 main x86_64 ) \
+    apache2-utils=foo $(: pkg-latest alpine edge  main x86_64 ) \
+    # This one returns an error instead, plus the untouched original line:
+    # pkg-latest: No such alpine package 'foo' on branch=edge repository=main arch=x86_64
+    foo=foo $(: pkg-latest alpine edge  main x86_64 ) \
+
+=cut
+
+my $rx_alpine = qr{
+    \A
+    (?<preamble>
+        \s*
+    )
+    (?:
+        (?<package>
+            \S+?
+        )
+        (?:
+            =
+            (?<version>
+                \S+
+            )
+        )?
+    )
+    (?<postamble>
+        \s+
+        [\$]
+        \(
+            :
+            \s+
+            pkg-latest
+            \s+
+            alpine
+            \s+
+            (?<branch>
+                edge
+              | v\d[.]\d+
+            )
+            \s+
+            (?<repository>
+                \S+
+            )
+            \s+
+            (?<arch>
+                \S+
+            )
+            \s*
+        \)
+        \s*
+        \\?
+        \s*
+    )
+    \z
+}xms;
+
+=for test_cases
+
+    lolcat       $(: pkg-latest debian buster/main amd64 ) \
+
+=cut
+
+my $rx_debian = qr{
+    \A
+    (?<preamble>
+        \s*
+    )
+    (?:
+        (?<package>
+            \S+?
+        )
+        (?:
+            =
+            (?<version>
+                \S+
+            )
+        )?
+    )
+    (?<postamble>
+        \s+
+        [\$]
+        \(
+            :
+            \s+
+            pkg-latest
+            \s+
+            debian
+            \s+
+            (?<branch>
+                \S+
+            )
+            /
+            (?<repository>
+                \S+
+            )
+            \s+
+            (?<arch>
+                \S+
+            )
+            \s*
+        \)
+        \s*
+        \\?
+        \s*
+    )
+    \z
+}xms;
+
+=for test_cases
+
+    # This is left as-is:
+    bash=1.123 \
+
+=cut
+
+my $rx_package_and_version = qr{
+    \A
+    (?<preamble>
+        \s*
+    )
+    (?:
+        (?<package>
+            \S+?
+        )
+        (?:
+            =
+            (?<version>
+                \S+
+            )
+        )
+    )
+    (?<postamble>
+        \s*
+        \\?
+        \s*
+    )?
+    \z
+}xms;
+
+my @FETCH_ARGS;
+my $TYPE = undef;
+if (defined $ARGV[0] && ($ARGV[0] eq 'alpine' || $ARGV[0] eq 'debian')) {
+    $TYPE = $ARGV[0];
+    shift @ARGV;
+    for (1..3) {
+        push @FETCH_ARGS, shift @ARGV;
+    }
+}
+
+while (my $line = <>) {
+    chomp $line;
+    if ($line =~ $rx_alpine) {
+        my %got = %+;
+        my $versions = fetch_alpine_apkindex($got{branch}, $got{repository}, $got{arch});
+        if (!exists $versions->{ $got{package} }) {
+            say "$got{preamble}# pkg-latest: No such alpine package '$got{package}' on branch=$got{branch} repository=$got{repository} arch=$got{arch}";
+            say "$line";
+            next;
+        }
+        say "$got{preamble}$got{package}=$versions->{$got{package}}$got{postamble}";
+    }
+    elsif ($line =~ $rx_debian) {
+        my %got = %+;
+        my $versions = fetch_debian_packages($got{branch}, $got{repository}, $got{arch});
+        if (!exists $versions->{ $got{package} }) {
+            say "$got{preamble}# pkg-latest: No such debian package '$got{package}' on branch=$got{branch} repository=$got{repository} arch=$got{arch}";
+            say "$line";
+            next;
+        }
+        say "$got{preamble}$got{package}=$versions->{$got{package}}$got{postamble}";
+    }
+    elsif ($TYPE && $line =~ $rx_package_and_version) {
+        my %got = %+;
+        if ($TYPE eq 'alpine') {
+            my $versions = fetch_alpine_apkindex(@FETCH_ARGS);
+            if (!exists $versions->{ $got{package} }) {
+                say "$got{preamble}# pkg-latest: No such alpine package '$got{package}' on branch=$got{branch} repository=$got{repository} arch=$got{arch}";
+                say "$line";
+                next;
+            }
+            say "$got{preamble}$got{package}=$versions->{$got{package}}$got{postamble}";
+        }
+        elsif ($TYPE eq 'debian') {
+            my $versions = fetch_debian_packages(@FETCH_ARGS);
+            if (!exists $versions->{ $got{package} }) {
+                say "$got{preamble}# pkg-latest: No such debian package '$got{package}' on branch=$got{branch} repository=$got{repository} arch=$got{arch}";
+                say "$line";
+                next;
+            }
+            say "$got{preamble}$got{package}=$versions->{$got{package}}$got{postamble}";
+        }
+        else {
+            say "$line";
+        }
+    }
+    else {
+        say "$line";
+    }
+}
+exit 0;
+
+sub fetch_alpine_apkindex {
+    my ($branch, $repository, $arch) = @_;
+
+    state $downloaded = {};
+
+    # Only fetch it if not yet fetched this run.
+    if (!exists $downloaded->{$branch}{$repository}{$arch}) {
+        my $tmp_file = "$TMP_PACKAGE_DIR/alpine-$branch-$repository-$arch.APKINDEX.tar.gz";
+        my @cmd = (qw<curl -sSLf>,
+            qq!"https://dl-cdn.alpinelinux.org/alpine/$branch/$repository/$arch/APKINDEX.tar.gz"!,
+            '-z', qq!"$tmp_file"!,
+            '-o', qq!"$tmp_file"!,
+        );
+        qx!@cmd!;
+        my $tar = Archive::Tar->new();
+        $tar->read($tmp_file);
+        die "$tmp_file does not contain APKINDEX file!"
+            if !$tar->contains_file('APKINDEX');
+        my $content = $tar->get_content('APKINDEX');
+        my @lines = split /\n/xms, $content;
+        my $current = undef;
+        my %versions;
+        for my $line (@lines) {
+            if ($line =~ m!\AP:(.+)\z!xms) {
+                $current = $1;
+                next;
+            }
+            if ($line =~ m!V:(.+)\z!xms) {
+                die "$tmp_file APKINDEX: Bad line '$line' without previous P:...!"
+                    if !defined $current;
+                $versions{$current} = $1;
+                next;
+            }
+            $current = undef
+                if !length $line;
+        }
+        $downloaded->{$branch}{$repository}{$arch} = { %versions };
+    }
+    return $downloaded->{$branch}{$repository}{$arch};
+}
+
+sub fetch_debian_packages {
+    my ($branch, $repository, $arch) = @_;
+
+    state $downloaded = {};
+
+    # Only fetch it if not yet fetched this run.
+    if (!exists $downloaded->{$branch}{$repository}{$arch}) {
+        my $tmp_file = "$TMP_PACKAGE_DIR/debian-$branch-$repository-$arch.Packages.gz";
+        my @cmd = (qw<curl -sSLf>,
+            qq!"https://ftp.debian.org/debian/dists/$branch/$repository/binary-$arch/Packages.gz"!,
+            '-z', qq!"$tmp_file"!,
+            '-o', qq!"$tmp_file"!,
+        );
+        qx!@cmd!;
+        my $content;
+        IO::Uncompress::Gunzip::gunzip($tmp_file, \$content)
+            or die "Could not gunzip $tmp_file: $IO::Uncompress::Gunzip::GunzipError";
+        my @lines = split /\n/xms, $content;
+        my $current = undef;
+        my %versions;
+        for my $line (@lines) {
+            if ($line =~ m!\APackage:\s+(.+)\z!xms) {
+                $current = $1;
+                next;
+            }
+            if ($line =~ m!Version:\s+(.+)\z!xms) {
+                die "$tmp_file Packages.gz: Bad line '$line' without previous Package:...!"
+                    if !defined $current;
+                $versions{$current} = $1;
+                next;
+            }
+            $current = undef
+                if !length $line;
+        }
+        $downloaded->{$branch}{$repository}{$arch} = { %versions };
+    }
+    return $downloaded->{$branch}{$repository}{$arch};
+}
